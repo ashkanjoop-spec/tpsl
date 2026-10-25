@@ -62,6 +62,9 @@ class TpSlService : AccessibilityService() {
 
     private var statusView: TextView? = null
     private var badgeView: TextView? = null
+    private var falconView: ImageView? = null
+    private var enabledBox: CheckBox? = null
+    private var prefListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
     private lateinit var prefs: SharedPreferences
     private val ui = Handler(Looper.getMainLooper())
@@ -88,6 +91,10 @@ class TpSlService : AccessibilityService() {
 
     override fun onDestroy() {
         try {
+            prefListener?.let { prefs.unregisterOnSharedPreferenceChangeListener(it) }
+        } catch (_: Exception) {
+        }
+        try {
             panel?.let { wm?.removeView(it) }
         } catch (_: Exception) {
         }
@@ -97,6 +104,7 @@ class TpSlService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!::prefs.isInitialized) return
+        if (!prefs.getBoolean("enabled", true)) return
         if (!prefs.getBoolean("auto", true) || busy) return
         if (event?.packageName?.toString() == packageName) return
         val now = SystemClock.uptimeMillis()
@@ -128,6 +136,10 @@ class TpSlService : AccessibilityService() {
     }
 
     private fun runApply() {
+        if (!prefs.getBoolean("enabled", true)) {
+            toast("Persia خاموشه")
+            return
+        }
         if (busy) return
         busy = true
         try {
@@ -543,6 +555,12 @@ class TpSlService : AccessibilityService() {
     // پنل شناور
     // ------------------------------------------------------------------
 
+    private fun applyEnabledLook() {
+        val on = prefs.getBoolean("enabled", true)
+        falconView?.alpha = if (on) 1f else 0.35f
+        enabledBox?.let { if (it.isChecked != on) it.isChecked = on }
+    }
+
     private fun lpWrap(): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -627,6 +645,7 @@ class TpSlService : AccessibilityService() {
         bubble.layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
         val falcon = ImageView(this)
         falcon.setImageResource(R.drawable.shahbaz)
+        falconView = falcon
         falcon.scaleType = ImageView.ScaleType.FIT_CENTER
         bubble.addView(falcon, FrameLayout.LayoutParams(dp(56), dp(56)))
         // نشانه کوچک نتیجه (✓ یا !) که چند ثانیه گوشه دکمه دیده میشه
@@ -644,6 +663,17 @@ class TpSlService : AccessibilityService() {
         content.visibility = View.GONE
         content.setPadding(dp(8), dp(8), dp(8), dp(8))
         content.background = bg(0xEE202124.toInt(), dp(12))
+
+        val en = CheckBox(this)
+        en.text = "فعال"
+        en.setTextColor(Color.WHITE)
+        en.isChecked = prefs.getBoolean("enabled", true)
+        en.setOnCheckedChangeListener { _, b ->
+            prefs.edit().putBoolean("enabled", b).apply()
+            falconView?.alpha = if (b) 1f else 0.35f
+        }
+        enabledBox = en
+        content.addView(en, lpWrap())
 
         content.addView(stepper("TP \$", 0xFF66BB6A.toInt(), "tp", 5f), lpWrap())
         content.addView(stepper("SL \$", 0xFFEF5350.toInt(), "sl", 3f), lpWrap())
@@ -722,6 +752,12 @@ class TpSlService : AccessibilityService() {
 
         manager.addView(box, lp)
         panel = box
+        applyEnabledLook()
+        val l = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == "enabled") ui.post { applyEnabledLook() }
+        }
+        prefListener = l
+        prefs.registerOnSharedPreferenceChangeListener(l)
     }
 
     // ------------------------------------------------------------------
