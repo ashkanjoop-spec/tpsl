@@ -204,31 +204,36 @@ class TpSlService : AccessibilityService() {
 
     /**
      * ضریب K: سود/ضرر دلاری = حجم × K × (اختلاف قیمت).
-     * برای بیت‌کوین K=1 (از اسکرین‌شات‌ها راستی‌آزمایی شد). برای نمادهای دیگه یک بار با زدن + و
-     * خوندن هم‌زمان "عدد فیلد" و "لیبل دلاری" کالیبره و ذخیره می‌شه.
-     * (لیبل دلاری فقط با + و − آپدیت میشه، نه با تایپ؛ پس هیچ‌وقت بعد از تایپ ازش استفاده نمی‌کنیم.)
+     * بیت‌کوین: K=1 ثابت (دست نمی‌خوره). نمادهای دیگه (اتریوم، طلا، ...): بار اول یک قیمت آزمایشی تایپ
+     * می‌کنیم، لیبل دلاری اپ رو می‌خونیم و K رو حساب و ذخیره می‌کنیم؛ دفعه‌های بعد مستقیم میره.
      */
     private fun kFor(c0: Ctx, isTp: Boolean): Double? {
         if (isBtc(c0.sym)) return 1.0
         val saved = prefs.getFloat("kv_" + c0.sym, 0f).toDouble()
         if (saved > 0.0) return saved
-        var cur: Ctx = c0
-        for (i in 0 until 8) {
-            pressPlus(cur, isTp)
-            Thread.sleep(400)
-            cur = scanNow() ?: return null
-            val f = if (isTp) cur.tpVal else cur.slVal
-            val l = if (isTp) cur.tpUsd else cur.slUsd
-            if (f != null && l != null && abs(l) >= 0.3) {
-                val dpx = abs(f - cur.open)
-                if (dpx > 0.0) {
-                    val k = abs(l) / (dpx * cur.vol)
+        var frac = 0.003
+        for (i in 0 until 3) {
+            val c = scanNow() ?: return null
+            val d = c.open * frac
+            val above = if (isTp) c.buy else !c.buy
+            val price = if (above) c.open + d else c.open - d
+            val txt = String.format(Locale.US, "%." + c.decimals + "f", price)
+            for (method in 0 until 2) {
+                val ok = if (method == 0) focusAndSet(isTp, txt) else focusAndPaste(isTp, txt)
+                if (!ok) continue
+                Thread.sleep(250)
+                val cc = scanNow() ?: return null
+                val l = if (isTp) cc.tpUsd else cc.slUsd
+                val tv = if (isTp) cc.tpVal else cc.slVal
+                if (l != null && tv != null && abs(tv - price) <= 0.011 && abs(l) >= 0.3) {
+                    val k = abs(l) / (abs(tv - cc.open) * cc.vol)
                     if (k >= 1e-4 && k <= 1e7) {
                         prefs.edit().putFloat("kv_" + c0.sym, k.toFloat()).apply()
                         return k
                     }
                 }
             }
+            frac *= 5 // لیبل خیلی کوچیک بود -> فاصله آزمایشی بزرگ‌تر
         }
         return null
     }
@@ -270,27 +275,42 @@ class TpSlService : AccessibilityService() {
      */
     private fun setOne(isTp: Boolean, usd: Double): Boolean {
         var c = scanNow() ?: return false
-        val k = kFor(c, isTp) ?: return false
-        c = scanNow() ?: return false
-        val d = usd / (c.vol * k)
-        // محافظ: فاصله نامعقول (خیلی کم یا بیشتر از ۲۰٪ قیمت) هرگز تایپ نمی‌شه
-        if (d.isNaN() || d < c.open * 1e-5 || d > c.open * 0.2) return false
-        val above = if (isTp) c.buy else !c.buy // خرید: سود بالاتر از قیمت بازشدن. فروش: پایین‌تر
-        val price = if (above) c.open + d else c.open - d
-        val txt = String.format(Locale.US, "%." + c.decimals + "f", price)
+        var k = kFor(c, isTp) ?: return false
+        val btc = isBtc(c.sym)
         val expected = if (isTp) usd else -usd
         val tol = max(0.03, 0.04 * usd)
 
-        for (method in 0 until 2) {
-            val ok = if (method == 0) focusAndSet(isTp, txt) else focusAndPaste(isTp, txt)
-            if (!ok) continue
-            Thread.sleep(250)
-            val cc = scanNow() ?: return false
-            val got = if (isTp) cc.tpUsd else cc.slUsd
-            val tv = if (isTp) cc.tpVal else cc.slVal
-            if (got != null && tv != null && abs(tv - price) <= 0.011 && abs(got - expected) <= tol) {
-                return true
+        for (attempt in 0 until 2) {
+            c = scanNow() ?: return false
+            val d = usd / (c.vol * k)
+            // محافظ: فاصله نامعقول (خیلی کم یا بیشتر از ۲۰٪ قیمت) هرگز تایپ نمی‌شه
+            if (d.isNaN() || d < c.open * 1e-5 || d > c.open * 0.2) return false
+            val above = if (isTp) c.buy else !c.buy // خرید: سود بالاتر از قیمت بازشدن. فروش: پایین‌تر
+            val price = if (above) c.open + d else c.open - d
+            val txt = String.format(Locale.US, "%." + c.decimals + "f", price)
+            var lastGot: Double? = null
+
+            for (method in 0 until 2) {
+                val ok = if (method == 0) focusAndSet(isTp, txt) else focusAndPaste(isTp, txt)
+                if (!ok) continue
+                Thread.sleep(250)
+                val cc = scanNow() ?: return false
+                val got = if (isTp) cc.tpUsd else cc.slUsd
+                val tv = if (isTp) cc.tpVal else cc.slVal
+                if (got != null && tv != null && abs(tv - price) <= 0.011) {
+                    if (abs(got - expected) <= tol) return true
+                    lastGot = got
+                }
             }
+
+            // فقط برای نمادهای غیر بیت‌کوین: یک بار اصلاح دقیق K از روی لیبل واقعی نزدیک هدف
+            if (btc || attempt == 1) return false
+            val g = lastGot ?: return false
+            if (g * expected <= 0 || abs(g) < 0.05) return false
+            val k2 = abs(g) / (abs(price - c.open) * c.vol)
+            if (k2 < 0.7 * k || k2 > 1.3 * k) return false
+            k = k2
+            prefs.edit().putFloat("kv_" + c.sym, k.toFloat()).apply()
         }
         return false
     }
