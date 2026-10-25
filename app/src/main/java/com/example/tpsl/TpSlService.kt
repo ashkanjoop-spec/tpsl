@@ -11,6 +11,7 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -128,12 +129,29 @@ class TpSlService : AccessibilityService() {
         if (busy) return
         busy = true
         try {
-            Thread.sleep(150)
+            Thread.sleep(50)
             val tpUsd = prefs.getFloat("tp", 5f).toDouble()
             val slUsd = prefs.getFloat("sl", 3f).toDouble()
             if (scanNow() == null) {
                 toast("پنجره حد سود/ضرر پیدا نشد")
                 return
+            }
+            // دکمه "تایید" فقط وقتی ظاهر می‌شه که اپ یک تغییر واقعی ببینه (تایپ تنها کافی نیست).
+            // پس قبل از تایپ یک بار + می‌زنیم؛ بعدش مقدار + با قیمت هدف جایگزین می‌شه.
+            val s0 = scanNow()
+            if (s0 != null && s0.confirm == null) {
+                pressPlus(s0, true)
+                var w = 0
+                while (w < 8 && scanNow()?.confirm == null) {
+                    Thread.sleep(120)
+                    w++
+                }
+            }
+            // برای حد ضرر هم یک بار + می‌زنیم، بعد مقدار با قیمت هدف جایگزین می‌شه
+            val s1 = scanNow()
+            if (s1 != null) {
+                pressPlus(s1, false)
+                Thread.sleep(200)
             }
             if (!setOne(true, tpUsd)) {
                 toast("حد سود ست نشد؛ دستی انجام بده (تایید زده نشد)")
@@ -159,9 +177,15 @@ class TpSlService : AccessibilityService() {
                 toast("مقادیر ثبت نشد؛ دستی انجام بده")
                 return
             }
-            val conf = c.confirm
+            var conf = c.confirm
+            if (conf == null && Build.VERSION.SDK_INT >= 30) {
+                // راه دوم: فشردن Enter کیبورد روی فیلد حد ضرر
+                c.slField?.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                Thread.sleep(500)
+                conf = scanNow()?.confirm
+            }
             if (conf == null) {
-                toast("دکمه تایید ظاهر نشد؛ خودت تایید رو بزن")
+                toast("فیلدها پر شد ولی دکمه تایید ظاهر نشد؛ خودت تایید رو بزن")
                 return
             }
             if (!prefs.getBoolean("confirm", true)) {
@@ -225,7 +249,7 @@ class TpSlService : AccessibilityService() {
         val field = (if (isTp) c.tpField else c.slField) ?: return false
         val txt = String.format(Locale.US, "%." + c.decimals + "f", price)
         if (!setFieldText(field, txt)) return false
-        Thread.sleep(300)
+        Thread.sleep(200)
         c = scanNow() ?: return false
         val typed = if (isTp) c.tpVal else c.slVal
         return typed != null && abs(typed - price) <= 0.011
