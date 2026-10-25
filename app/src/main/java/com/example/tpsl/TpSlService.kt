@@ -54,7 +54,7 @@ class TpSlService : AccessibilityService() {
         val slField: AccessibilityNodeInfo?,
         val slVal: Double?,
         val slUsd: Double?,
-        val confirm: AccessibilityNodeInfo
+        val confirm: AccessibilityNodeInfo?
     )
 
     private lateinit var prefs: SharedPreferences
@@ -140,17 +140,29 @@ class TpSlService : AccessibilityService() {
                 toast("حد ضرر ست نشد؛ دستی انجام بده (تایید زده نشد)")
                 return
             }
-            val c = scanNow()
+            var c = scanNow()
+            var tries = 0
+            while (c != null && c.confirm == null && tries < 8) {
+                Thread.sleep(200)
+                c = scanNow()
+                tries++
+            }
             if (c == null) {
                 toast("پنجره بسته شد")
                 return
             }
-            clickConfirm(c.confirm)
+            val conf = c.confirm
+            if (conf == null) {
+                toast("دکمه تایید ظاهر نشد؛ خودت تایید رو بزن")
+                return
+            }
+            clickConfirm(conf)
             Thread.sleep(700)
             val c2 = scanNow()
             if (c2 != null) {
-                // هنوز بازه؛ یک بار با لمس مختصاتی امتحان کن
-                tapCenter(c2.confirm)
+                // هنوز بازه؛ یک بار با لمس مختصاتی روی همون دکمه تایید
+                val conf2 = c2.confirm
+                if (conf2 != null) tapCenter(conf2)
                 Thread.sleep(700)
             }
             toast(if (scanNow() == null) "TP/SL ست شد ✓" else "تایید زده شد؛ نتیجه رو چک کن")
@@ -171,6 +183,13 @@ class TpSlService : AccessibilityService() {
         var prev: Double? = if (isTp) c.tpUsd else c.slUsd
 
         for (attempt in 0 until 3) {
+            if (attempt == 0 && (if (isTp) c.tpUsd else c.slUsd) == null) {
+                // تا یک بار + نزنی، لیبل دلاری نشون داده نمیشه؛ پس اول خودش + می‌زنه
+                pressPlus(c, isTp)
+                Thread.sleep(400)
+                c = scanNow() ?: return false
+                prev = if (isTp) c.tpUsd else c.slUsd
+            }
             val d = usd / (c.vol * k)
             val above = if (isTp) c.buy else !c.buy // آیا قیمت هدف بالاتر از قیمت بازشدن باشه؟
             val price = if (above) c.open + d else c.open - d
@@ -225,12 +244,50 @@ class TpSlService : AccessibilityService() {
     private fun tapCenter(n: AccessibilityNodeInfo) {
         val r = Rect()
         n.getBoundsInScreen(r)
+        tapAt(r.exactCenterX(), r.exactCenterY())
+    }
+
+    private fun tapAt(x: Float, y: Float) {
         val p = Path()
-        p.moveTo(r.exactCenterX(), r.exactCenterY())
+        p.moveTo(x, y)
         val g = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(p, 0, 60))
             .build()
         dispatchGesture(g, null, null)
+    }
+
+    /** دکمه + کنار فیلد (سمت چپ فیلد، هم‌ردیف) رو یک بار می‌زنه. */
+    private fun pressPlus(c: Ctx, isTp: Boolean) {
+        val root = rootInActiveWindow ?: return
+        val fieldNode = (if (isTp) c.tpField else c.slField) ?: return
+        val fr = Rect()
+        fieldNode.getBoundsInScreen(fr)
+        val tol = max(26, fr.height())
+        var best: AccessibilityNodeInfo? = null
+        var bestX = Int.MAX_VALUE
+        fun walk(n: AccessibilityNodeInfo?, d: Int) {
+            if (n == null || d > 60) return
+            if (n.isClickable) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (abs(r.centerY() - fr.centerY()) <= tol && r.centerX() < fr.centerX() && r.centerX() < bestX) {
+                    best = n
+                    bestX = r.centerX()
+                }
+            }
+            for (i in 0 until n.childCount) walk(n.getChild(i), d + 1)
+        }
+        walk(root, 0)
+        val b = best
+        if (b != null && b.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return
+        val x = if (b != null) {
+            val r = Rect()
+            b.getBoundsInScreen(r)
+            r.exactCenterX()
+        } else {
+            fr.exactCenterX() - 0.1417f * resources.displayMetrics.widthPixels
+        }
+        tapAt(x, fr.exactCenterY())
     }
 
     // ------------------------------------------------------------------
@@ -275,9 +332,10 @@ class TpSlService : AccessibilityService() {
         val openL = all.firstOrNull { key(it.t).startsWith("بازشده") } ?: return null
         val volL = all.firstOrNull { key(it.t).startsWith("حجم") }
         val idL = all.firstOrNull { key(it.t).startsWith("شناسه") }
+        // قبل از ویرایش، دکمه پایین "بستن $..." است (بستن معامله!). فقط متن دقیقاً "تایید" قبول است.
         val confirm = all
             .filter { key(it.t) == "تایید" && it.r.centerY() > slL.r.centerY() }
-            .minByOrNull { it.r.centerY() } ?: return null
+            .minByOrNull { it.r.centerY() }
 
         // جهت معامله از عنوان پنجره ("BITCOIN خرید" / "BITCOIN فروش")
         val limitY = (volL ?: tpL).r.centerY()
@@ -328,7 +386,7 @@ class TpSlService : AccessibilityService() {
             slField = slF?.n,
             slVal = slF?.let { parseNum(it.t) ?: 0.0 },
             slUsd = usd(slL),
-            confirm = confirm.n
+            confirm = confirm?.n
         )
     }
 
@@ -377,6 +435,12 @@ class TpSlService : AccessibilityService() {
     // ------------------------------------------------------------------
     // پنل شناور
     // ------------------------------------------------------------------
+
+    private fun lpWrap(): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        )
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -465,15 +529,15 @@ class TpSlService : AccessibilityService() {
         content.setPadding(dp(8), dp(8), dp(8), dp(8))
         content.background = bg(0xEE202124.toInt(), dp(12))
 
-        content.addView(stepper("TP \$", 0xFF66BB6A.toInt(), "tp", 5f))
-        content.addView(stepper("SL \$", 0xFFEF5350.toInt(), "sl", 3f))
+        content.addView(stepper("TP \$", 0xFF66BB6A.toInt(), "tp", 5f), lpWrap())
+        content.addView(stepper("SL \$", 0xFFEF5350.toInt(), "sl", 3f), lpWrap())
 
         val auto = CheckBox(this)
         auto.text = "خودکار"
         auto.setTextColor(Color.WHITE)
         auto.isChecked = prefs.getBoolean("auto", true)
         auto.setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("auto", b).apply() }
-        content.addView(auto)
+        content.addView(auto, lpWrap())
 
         val btnRow = LinearLayout(this)
         btnRow.orientation = LinearLayout.HORIZONTAL
@@ -482,10 +546,10 @@ class TpSlService : AccessibilityService() {
         spacer.layoutParams = LinearLayout.LayoutParams(dp(8), 1)
         btnRow.addView(spacer)
         btnRow.addView(mkBtn("تشخیص", 0xFF6A1B9A.toInt(), { worker.execute { dump() } }))
-        content.addView(btnRow)
+        content.addView(btnRow, lpWrap())
 
         box.addView(bubble)
-        box.addView(content)
+        box.addView(content, lpWrap())
 
         var sx = 0f
         var sy = 0f
