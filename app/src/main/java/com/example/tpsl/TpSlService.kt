@@ -136,23 +136,6 @@ class TpSlService : AccessibilityService() {
                 toast("پنجره حد سود/ضرر پیدا نشد")
                 return
             }
-            // دکمه "تایید" فقط وقتی ظاهر می‌شه که اپ یک تغییر واقعی ببینه (تایپ تنها کافی نیست).
-            // پس قبل از تایپ یک بار + می‌زنیم؛ بعدش مقدار + با قیمت هدف جایگزین می‌شه.
-            val s0 = scanNow()
-            if (s0 != null && s0.confirm == null) {
-                pressPlus(s0, true)
-                var w = 0
-                while (w < 8 && scanNow()?.confirm == null) {
-                    Thread.sleep(120)
-                    w++
-                }
-            }
-            // برای حد ضرر هم یک بار + می‌زنیم، بعد مقدار با قیمت هدف جایگزین می‌شه
-            val s1 = scanNow()
-            if (s1 != null) {
-                pressPlus(s1, false)
-                Thread.sleep(200)
-            }
             if (!setOne(true, tpUsd)) {
                 toast("حد سود ست نشد؛ دستی انجام بده (تایید زده نشد)")
                 return
@@ -179,10 +162,22 @@ class TpSlService : AccessibilityService() {
             }
             var conf = c.confirm
             if (conf == null && Build.VERSION.SDK_INT >= 30) {
-                // راه دوم: فشردن Enter کیبورد روی فیلد حد ضرر
+                // راه اول: Enter کیبورد روی فیلد حد ضرر
                 c.slField?.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
-                Thread.sleep(500)
+                Thread.sleep(400)
                 conf = scanNow()?.confirm
+            }
+            if (conf == null) {
+                // راه دوم: یک + واقعی بزن (دکمه تایید ظاهر میشه) و حد ضرر رو دوباره تایپ کن
+                val cx = scanNow()
+                if (cx != null) {
+                    pressPlus(cx, false)
+                    Thread.sleep(250)
+                    if (setOne(false, slUsd)) {
+                        Thread.sleep(150)
+                        conf = scanNow()?.confirm
+                    }
+                }
             }
             if (conf == null) {
                 toast("فیلدها پر شد ولی دکمه تایید ظاهر نشد؛ خودت تایید رو بزن")
@@ -193,7 +188,7 @@ class TpSlService : AccessibilityService() {
                 return
             }
             if (!conf.performAction(AccessibilityNodeInfo.ACTION_CLICK)) tapCenter(conf)
-            Thread.sleep(700)
+            Thread.sleep(500)
             toast(if (scanNow() == null) "TP/SL ست شد ✓" else "تایید زده شد؛ نتیجه رو چک کن")
         } catch (e: Exception) {
             toast("خطا: " + e.message)
@@ -236,7 +231,41 @@ class TpSlService : AccessibilityService() {
         return null
     }
 
-    /** یک فیلد (حد سود یا حد ضرر) رو روی مقدار دلاری مورد نظر تایپ می‌کنه و چک می‌کنه فیلد عدد رو قبول کرده. */
+    private fun fieldOf(c: Ctx, isTp: Boolean): AccessibilityNodeInfo? =
+        if (isTp) c.tpField else c.slField
+
+    /** روی فیلد کلیک می‌کنه (فوکوس واقعی ورودی + باز شدن کیبورد) و گره تازه فیلد رو برمی‌گردونه. */
+    private fun clickField(isTp: Boolean): AccessibilityNodeInfo? {
+        val c = scanNow() ?: return null
+        fieldOf(c, isTp)?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        Thread.sleep(250)
+        val c2 = scanNow() ?: return null
+        return fieldOf(c2, isTp)
+    }
+
+    private fun focusAndSet(isTp: Boolean, text: String): Boolean {
+        val node = clickField(isTp) ?: return false
+        val args = Bundle()
+        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    private fun focusAndPaste(isTp: Boolean, text: String): Boolean {
+        val node = clickField(isTp) ?: return false
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("p", text))
+        val sel = Bundle()
+        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, node.text?.length ?: 0)
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, sel)
+        Thread.sleep(80)
+        return node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+    }
+
+    /**
+     * یک فیلد رو روی مقدار دلاری هدف می‌ذاره. موفقیت فقط وقتی حساب می‌شه که لیبل دلاری خود اپ
+     * (که با مقدار واقعی فیلد آپدیت میشه) با هدف بخونه؛ تایپی که اپ قبول نکرده هیچ‌وقت تایید نمی‌شه.
+     */
     private fun setOne(isTp: Boolean, usd: Double): Boolean {
         var c = scanNow() ?: return false
         val k = kFor(c, isTp) ?: return false
@@ -246,30 +275,22 @@ class TpSlService : AccessibilityService() {
         if (d.isNaN() || d < c.open * 1e-5 || d > c.open * 0.2) return false
         val above = if (isTp) c.buy else !c.buy // خرید: سود بالاتر از قیمت بازشدن. فروش: پایین‌تر
         val price = if (above) c.open + d else c.open - d
-        val field = (if (isTp) c.tpField else c.slField) ?: return false
         val txt = String.format(Locale.US, "%." + c.decimals + "f", price)
-        if (!setFieldText(field, txt)) return false
-        Thread.sleep(200)
-        c = scanNow() ?: return false
-        val typed = if (isTp) c.tpVal else c.slVal
-        return typed != null && abs(typed - price) <= 0.011
-    }
+        val expected = if (isTp) usd else -usd
+        val tol = max(0.03, 0.04 * usd)
 
-    private fun setFieldText(node: AccessibilityNodeInfo, text: String): Boolean {
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        val args = Bundle()
-        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
-        // روش جایگزین: کلیک، انتخاب همه، چسباندن
-        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        Thread.sleep(400)
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("p", text))
-        val sel = Bundle()
-        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
-        sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, node.text?.length ?: 0)
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, sel)
-        return node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        for (method in 0 until 2) {
+            val ok = if (method == 0) focusAndSet(isTp, txt) else focusAndPaste(isTp, txt)
+            if (!ok) continue
+            Thread.sleep(250)
+            val cc = scanNow() ?: return false
+            val got = if (isTp) cc.tpUsd else cc.slUsd
+            val tv = if (isTp) cc.tpVal else cc.slVal
+            if (got != null && tv != null && abs(tv - price) <= 0.011 && abs(got - expected) <= tol) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun clickConfirm(n: AccessibilityNodeInfo) {
