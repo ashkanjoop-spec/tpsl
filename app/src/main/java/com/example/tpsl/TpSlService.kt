@@ -23,6 +23,8 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.CheckBox
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -59,7 +61,7 @@ class TpSlService : AccessibilityService() {
     )
 
     private var statusView: TextView? = null
-    private var bubbleView: TextView? = null
+    private var badgeView: TextView? = null
 
     private lateinit var prefs: SharedPreferences
     private val ui = Handler(Looper.getMainLooper())
@@ -600,15 +602,23 @@ class TpSlService : AccessibilityService() {
         val box = LinearLayout(this)
         box.orientation = LinearLayout.VERTICAL
 
-        val bubble = TextView(this)
-        bubble.text = "⚡"
-        bubble.textSize = 20f
-        bubble.gravity = Gravity.CENTER
-        bubble.setTextColor(Color.WHITE)
-        bubble.background = bg(0xCC1E88E5.toInt(), dp(24))
-        bubble.layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
-
-        bubbleView = bubble
+        // دکمه شناور: فقط شهباز، بدون پس‌زمینه
+        val bubble = FrameLayout(this)
+        bubble.layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+        val falcon = ImageView(this)
+        falcon.setImageResource(R.drawable.shahbaz)
+        falcon.scaleType = ImageView.ScaleType.FIT_CENTER
+        bubble.addView(falcon, FrameLayout.LayoutParams(dp(56), dp(56)))
+        // نشانه کوچک نتیجه (✓ یا !) که چند ثانیه گوشه دکمه دیده میشه
+        val badge = TextView(this)
+        badge.textSize = 12f
+        badge.gravity = Gravity.CENTER
+        badge.setTextColor(Color.WHITE)
+        badge.visibility = View.GONE
+        val bl = FrameLayout.LayoutParams(dp(20), dp(20))
+        bl.gravity = Gravity.TOP or Gravity.END
+        bubble.addView(badge, bl)
+        badgeView = badge
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
         content.visibility = View.GONE
@@ -747,9 +757,12 @@ class TpSlService : AccessibilityService() {
             } catch (_: Exception) {
             }
             statusView?.text = msg
-            bubbleView?.let { b ->
-                b.text = if (msg.contains("✓")) "✓" else "!"
-                ui.postDelayed({ b.text = "⚡" }, 4000)
+            badgeView?.let { b ->
+                val good = msg.contains("✓")
+                b.text = if (good) "✓" else "!"
+                b.background = bg(if (good) 0xFF2E7D32.toInt() else 0xFFC62828.toInt(), dp(10))
+                b.visibility = View.VISIBLE
+                ui.postDelayed({ b.visibility = View.GONE }, 4000)
             }
         }
     }
