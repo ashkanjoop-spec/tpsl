@@ -54,8 +54,7 @@ class TpSlService : AccessibilityService() {
         val slField: AccessibilityNodeInfo?,
         val slVal: Double?,
         val slUsd: Double?,
-        val confirmX: Float,
-        val confirmY: Float
+        val confirm: AccessibilityNodeInfo?
     )
 
     private var statusView: TextView? = null
@@ -129,7 +128,7 @@ class TpSlService : AccessibilityService() {
         if (busy) return
         busy = true
         try {
-            Thread.sleep(350)
+            Thread.sleep(150)
             val tpUsd = prefs.getFloat("tp", 5f).toDouble()
             val slUsd = prefs.getFloat("sl", 3f).toDouble()
             if (scanNow() == null) {
@@ -144,30 +143,33 @@ class TpSlService : AccessibilityService() {
                 toast("حد ضرر ست نشد؛ دستی انجام بده (تایید زده نشد)")
                 return
             }
-            // کیبورد رو ببند تا چیدمان ثابت بمونه، بعد مقادیر رو دوباره چک کن
-            val c1 = scanNow()
-            if (c1 == null) {
+            // منتظر بمون تا دکمه "تایید" ظاهر بشه (نشونه اینه که اپ تغییر فیلدها رو قبول کرده)
+            var c: Ctx? = scanNow()
+            var tries = 0
+            while (c != null && c.confirm == null && tries < 10) {
+                Thread.sleep(150)
+                c = scanNow()
+                tries++
+            }
+            if (c == null) {
                 toast("پنجره بسته شد")
                 return
             }
-            c1.tpField?.performAction(AccessibilityNodeInfo.ACTION_CLEAR_FOCUS)
-            c1.slField?.performAction(AccessibilityNodeInfo.ACTION_CLEAR_FOCUS)
-            Thread.sleep(450)
-            val c2 = scanNow()
-            if (c2 == null) {
-                toast("پنجره بسته شد")
-                return
-            }
-            if ((c2.tpVal ?: 0.0) == 0.0 || (c2.slVal ?: 0.0) == 0.0) {
+            if ((c.tpVal ?: 0.0) == 0.0 || (c.slVal ?: 0.0) == 0.0) {
                 toast("مقادیر ثبت نشد؛ دستی انجام بده")
                 return
             }
-            if (!prefs.getBoolean("confirm", false)) {
+            val conf = c.confirm
+            if (conf == null) {
+                toast("دکمه تایید ظاهر نشد؛ خودت تایید رو بزن")
+                return
+            }
+            if (!prefs.getBoolean("confirm", true)) {
                 toast("TP/SL پر شد ✓ تایید رو خودت بزن")
                 return
             }
-            tapAt(c2.confirmX, c2.confirmY)
-            Thread.sleep(800)
+            if (!conf.performAction(AccessibilityNodeInfo.ACTION_CLICK)) tapCenter(conf)
+            Thread.sleep(700)
             toast(if (scanNow() == null) "TP/SL ست شد ✓" else "تایید زده شد؛ نتیجه رو چک کن")
         } catch (e: Exception) {
             toast("خطا: " + e.message)
@@ -176,59 +178,57 @@ class TpSlService : AccessibilityService() {
         }
     }
 
-    /** یک فیلد (حد سود یا حد ضرر) رو روی مقدار دلاری مورد نظر ست می‌کنه و راستی‌آزمایی می‌کنه. */
+    private fun isBtc(sym: String): Boolean =
+        sym.contains("BITCOIN", true) || sym.contains("BTC", true)
+
+    /**
+     * ضریب K: سود/ضرر دلاری = حجم × K × (اختلاف قیمت).
+     * برای بیت‌کوین K=1 (از اسکرین‌شات‌ها راستی‌آزمایی شد). برای نمادهای دیگه یک بار با زدن + و
+     * خوندن هم‌زمان "عدد فیلد" و "لیبل دلاری" کالیبره و ذخیره می‌شه.
+     * (لیبل دلاری فقط با + و − آپدیت میشه، نه با تایپ؛ پس هیچ‌وقت بعد از تایپ ازش استفاده نمی‌کنیم.)
+     */
+    private fun kFor(c0: Ctx, isTp: Boolean): Double? {
+        if (isBtc(c0.sym)) return 1.0
+        val saved = prefs.getFloat("kv_" + c0.sym, 0f).toDouble()
+        if (saved > 0.0) return saved
+        var cur: Ctx = c0
+        for (i in 0 until 8) {
+            pressPlus(cur, isTp)
+            Thread.sleep(400)
+            cur = scanNow() ?: return null
+            val f = if (isTp) cur.tpVal else cur.slVal
+            val l = if (isTp) cur.tpUsd else cur.slUsd
+            if (f != null && l != null && abs(l) >= 0.3) {
+                val dpx = abs(f - cur.open)
+                if (dpx > 0.0) {
+                    val k = abs(l) / (dpx * cur.vol)
+                    if (k >= 1e-4 && k <= 1e7) {
+                        prefs.edit().putFloat("kv_" + c0.sym, k.toFloat()).apply()
+                        return k
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /** یک فیلد (حد سود یا حد ضرر) رو روی مقدار دلاری مورد نظر تایپ می‌کنه و چک می‌کنه فیلد عدد رو قبول کرده. */
     private fun setOne(isTp: Boolean, usd: Double): Boolean {
         var c = scanNow() ?: return false
-        val kKey = "k_" + c.sym
-        var k = prefs.getFloat(kKey, 1f).toDouble()
-        val expected = if (isTp) usd else -usd
-        val tol = max(0.02, 0.03 * usd)
-        var prev: Double? = if (isTp) c.tpUsd else c.slUsd
-
-        for (attempt in 0 until 3) {
-            if (attempt == 0 && (if (isTp) c.tpUsd else c.slUsd) == null) {
-                // تا یک بار + نزنی، لیبل دلاری نشون داده نمیشه؛ پس اول خودش + می‌زنه
-                pressPlus(c, isTp)
-                Thread.sleep(400)
-                c = scanNow() ?: return false
-                prev = if (isTp) c.tpUsd else c.slUsd
-            }
-            val d = usd / (c.vol * k)
-            val above = if (isTp) c.buy else !c.buy // آیا قیمت هدف بالاتر از قیمت بازشدن باشه؟
-            val price = if (above) c.open + d else c.open - d
-            val field = (if (isTp) c.tpField else c.slField) ?: return false
-            val txt = String.format(Locale.US, "%." + c.decimals + "f", price)
-            if (!setFieldText(field, txt)) return false
-            Thread.sleep(450)
-
-            c = scanNow() ?: return false
-            var got = if (isTp) c.tpUsd else c.slUsd
-            if (got == null || got == prev) {
-                // شاید لیبل دلاری تا فوکوس نره آپدیت نشه
-                (if (isTp) c.tpField else c.slField)?.performAction(AccessibilityNodeInfo.ACTION_CLEAR_FOCUS)
-                Thread.sleep(450)
-                c = scanNow() ?: return false
-                got = if (isTp) c.tpUsd else c.slUsd
-            }
-            val typed = if (isTp) c.tpVal else c.slVal
-            if (typed == null || abs(typed - price) > 0.011) return false // فیلد عدد رو قبول نکرد
-            if (got == null) {
-                val trusted = c.sym.contains("BITCOIN", true) || c.sym.contains("BTC", true) ||
-                    prefs.getBoolean("ok_" + c.sym, false)
-                return trusted
-            }
-            if (got * expected < 0) return false // جهت اشتباه -> هیچ‌وقت تایید نکن
-            if (abs(got - expected) <= tol) {
-                prefs.edit().putBoolean("ok_" + c.sym, true).apply()
-                return true
-            }
-            if (got == 0.0) return false
-            // اصلاح ضریب (مثلاً سایز قرارداد نماد) بر اساس عدد واقعی که اپ نشون داد
-            k = abs(got) / (abs(price - c.open) * c.vol)
-            prefs.edit().putFloat(kKey, k.toFloat()).apply()
-            prev = got
-        }
-        return false
+        val k = kFor(c, isTp) ?: return false
+        c = scanNow() ?: return false
+        val d = usd / (c.vol * k)
+        // محافظ: فاصله نامعقول (خیلی کم یا بیشتر از ۲۰٪ قیمت) هرگز تایپ نمی‌شه
+        if (d.isNaN() || d < c.open * 1e-5 || d > c.open * 0.2) return false
+        val above = if (isTp) c.buy else !c.buy // خرید: سود بالاتر از قیمت بازشدن. فروش: پایین‌تر
+        val price = if (above) c.open + d else c.open - d
+        val field = (if (isTp) c.tpField else c.slField) ?: return false
+        val txt = String.format(Locale.US, "%." + c.decimals + "f", price)
+        if (!setFieldText(field, txt)) return false
+        Thread.sleep(300)
+        c = scanNow() ?: return false
+        val typed = if (isTp) c.tpVal else c.slVal
+        return typed != null && abs(typed - price) <= 0.011
     }
 
     private fun setFieldText(node: AccessibilityNodeInfo, text: String): Boolean {
@@ -411,8 +411,8 @@ class TpSlService : AccessibilityService() {
         val tpUsd = nearUsd(tpI) ?: parseDollar(tpSeg)
         val slUsd = nearUsd(slI) ?: parseDollar(slSeg)
 
-        val wpx = resources.displayMetrics.widthPixels.toFloat()
-        val sc = wpx / 1080f
+        // دکمه "تایید" فقط بعد از تغییر فیلدها توی درخت ظاهر میشه (قبلش "بستن" است که توی درخت نیست)
+        val confirm = all.firstOrNull { key(it.t) == "تایید" && it.n.isClickable }?.n
         return Ctx(
             buy = hasBuy,
             sym = sym,
@@ -426,8 +426,7 @@ class TpSlService : AccessibilityService() {
             slField = slI.n,
             slVal = parseNum(slI.t) ?: 0.0,
             slUsd = slUsd,
-            confirmX = wpx / 2f,
-            confirmY = slI.r.centerY() + 166f * sc
+            confirm = confirm
         )
     }
 
@@ -584,7 +583,7 @@ class TpSlService : AccessibilityService() {
         val conf = CheckBox(this)
         conf.text = "تایید خودکار"
         conf.setTextColor(Color.WHITE)
-        conf.isChecked = prefs.getBoolean("confirm", false)
+        conf.isChecked = prefs.getBoolean("confirm", true)
         conf.setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("confirm", b).apply() }
         content.addView(conf, lpWrap())
 
