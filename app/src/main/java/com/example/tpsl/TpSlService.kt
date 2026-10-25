@@ -54,8 +54,12 @@ class TpSlService : AccessibilityService() {
         val slField: AccessibilityNodeInfo?,
         val slVal: Double?,
         val slUsd: Double?,
-        val confirm: AccessibilityNodeInfo?
+        val confirmX: Float,
+        val confirmY: Float
     )
+
+    private var statusView: TextView? = null
+    private var bubbleView: TextView? = null
 
     private lateinit var prefs: SharedPreferences
     private val ui = Handler(Looper.getMainLooper())
@@ -140,31 +144,30 @@ class TpSlService : AccessibilityService() {
                 toast("حد ضرر ست نشد؛ دستی انجام بده (تایید زده نشد)")
                 return
             }
-            var c = scanNow()
-            var tries = 0
-            while (c != null && c.confirm == null && tries < 8) {
-                Thread.sleep(200)
-                c = scanNow()
-                tries++
-            }
-            if (c == null) {
+            // کیبورد رو ببند تا چیدمان ثابت بمونه، بعد مقادیر رو دوباره چک کن
+            val c1 = scanNow()
+            if (c1 == null) {
                 toast("پنجره بسته شد")
                 return
             }
-            val conf = c.confirm
-            if (conf == null) {
-                toast("دکمه تایید ظاهر نشد؛ خودت تایید رو بزن")
+            c1.tpField?.performAction(AccessibilityNodeInfo.ACTION_CLEAR_FOCUS)
+            c1.slField?.performAction(AccessibilityNodeInfo.ACTION_CLEAR_FOCUS)
+            Thread.sleep(450)
+            val c2 = scanNow()
+            if (c2 == null) {
+                toast("پنجره بسته شد")
                 return
             }
-            clickConfirm(conf)
-            Thread.sleep(700)
-            val c2 = scanNow()
-            if (c2 != null) {
-                // هنوز بازه؛ یک بار با لمس مختصاتی روی همون دکمه تایید
-                val conf2 = c2.confirm
-                if (conf2 != null) tapCenter(conf2)
-                Thread.sleep(700)
+            if ((c2.tpVal ?: 0.0) == 0.0 || (c2.slVal ?: 0.0) == 0.0) {
+                toast("مقادیر ثبت نشد؛ دستی انجام بده")
+                return
             }
+            if (!prefs.getBoolean("confirm", false)) {
+                toast("TP/SL پر شد ✓ تایید رو خودت بزن")
+                return
+            }
+            tapAt(c2.confirmX, c2.confirmY)
+            Thread.sleep(800)
             toast(if (scanNow() == null) "TP/SL ست شد ✓" else "تایید زده شد؛ نتیجه رو چک کن")
         } catch (e: Exception) {
             toast("خطا: " + e.message)
@@ -207,9 +210,18 @@ class TpSlService : AccessibilityService() {
                 c = scanNow() ?: return false
                 got = if (isTp) c.tpUsd else c.slUsd
             }
-            if (got == null) return false
+            val typed = if (isTp) c.tpVal else c.slVal
+            if (typed == null || abs(typed - price) > 0.011) return false // فیلد عدد رو قبول نکرد
+            if (got == null) {
+                val trusted = c.sym.contains("BITCOIN", true) || c.sym.contains("BTC", true) ||
+                    prefs.getBoolean("ok_" + c.sym, false)
+                return trusted
+            }
             if (got * expected < 0) return false // جهت اشتباه -> هیچ‌وقت تایید نکن
-            if (abs(got - expected) <= tol) return true
+            if (abs(got - expected) <= tol) {
+                prefs.edit().putBoolean("ok_" + c.sym, true).apply()
+                return true
+            }
             if (got == 0.0) return false
             // اصلاح ضریب (مثلاً سایز قرارداد نماد) بر اساس عدد واقعی که اپ نشون داد
             k = abs(got) / (abs(price - c.open) * c.vol)
@@ -325,54 +337,82 @@ class TpSlService : AccessibilityService() {
         }.sortedBy { abs(it.r.centerY() - label.r.centerY()) }
     }
 
+    private fun fixText(s: String): String =
+        normalizeDigits(s)
+            .replace('\u064A', '\u06CC')
+            .replace('\u0643', '\u06A9')
+            .replace('\u0623', '\u0627')
+            .replace('\u200c', ' ')
+            .replace("\u200f", "")
+            .replace("\u200e", "")
+
+    /**
+     * ساختار واقعی صفحه ترندو (فلاتر): همه برچسب‌ها (حجم، شناسه، بازشده در، حد سود، حد ضرر) توی یک
+     * گره ادغام‌شده هستن و سه تا EditText جدا برای حجم / حد سود / حد ضرر وجود داره.
+     * دکمه پایین (بستن/تایید) توی درخت نیست؛ با مختصات نسبی زده میشه.
+     */
     private fun scan(root: AccessibilityNodeInfo): Ctx? {
         val all = collect(root)
-        val tpL = all.firstOrNull { key(it.t).startsWith("حدسود") } ?: return null
-        val slL = all.firstOrNull { key(it.t).startsWith("حدضرر") } ?: return null
-        val openL = all.firstOrNull { key(it.t).startsWith("بازشده") } ?: return null
-        val volL = all.firstOrNull { key(it.t).startsWith("حجم") }
-        val idL = all.firstOrNull { key(it.t).startsWith("شناسه") }
-        // قبل از ویرایش، دکمه پایین "بستن $..." است (بستن معامله!). فقط متن دقیقاً "تایید" قبول است.
-        val confirm = all
-            .filter { key(it.t) == "تایید" && it.r.centerY() > slL.r.centerY() }
-            .minByOrNull { it.r.centerY() }
-
-        // جهت معامله از عنوان پنجره ("BITCOIN خرید" / "BITCOIN فروش")
-        val limitY = (volL ?: tpL).r.centerY()
-        val title = all.filter {
+        val dlg = all.firstOrNull {
             val k = key(it.t)
-            it.r.centerY() < limitY && (k.contains("خرید") || k.contains("فروش"))
-        }.maxByOrNull { it.r.centerY() } ?: return null
-        val tk = key(title.t)
-        val hasBuy = tk.contains("خرید")
-        val hasSell = tk.contains("فروش")
-        if (hasBuy == hasSell) return null
-        val sym = title.t.replace("خرید", "").replace("فروش", "").trim().ifEmpty { "x" }
+            k.contains("حدسود") && k.contains("حدضرر")
+        }
+        val d = if (dlg != null) fixText(dlg.t)
+        else {
+            val blob = all.joinToString("\n") { fixText(it.t) }
+            val k = key(blob)
+            if (k.contains("حدسود") && k.contains("حدضرر")) blob else return null
+        }
 
-        val openIt = rowOf(all, openL).firstOrNull { cleanNum(it.t) != null } ?: return null
-        val openStr = cleanNum(openIt.t) ?: return null
+        val titlePart = d.substringBefore("حجم")
+        val hasBuy = titlePart.contains("خرید")
+        val hasSell = titlePart.contains("فروش")
+        if (hasBuy == hasSell) return null
+        val sym = titlePart.replace("خرید", "").replace("فروش", "").trim()
+            .lines().firstOrNull { it.isNotBlank() }?.trim() ?: "x"
+
+        val openRaw = Regex("باز\\s*شده\\s*در\\s*:?\\s*(-?[0-9]+(?:[.,/][0-9]+)?)")
+            .find(d)?.groupValues?.get(1)
+        val openStr = cleanNum(openRaw) ?: return null
         val open = openStr.toDouble()
         val decimals = max(2, openStr.substringAfter('.', "").length).coerceAtMost(6)
+        val id = Regex("شناسه\\s*:?\\s*([0-9]+)").find(d)?.groupValues?.get(1)
 
-        val vol = volL?.let { l -> rowOf(all, l).firstNotNullOfOrNull { parseNum(it.t) } }
-            ?: 0.01
+        val eds = all.filter { it.n.isEditable }.sortedBy { it.r.centerY() }
+        if (eds.size < 3) return null
+        val volI = eds[eds.size - 3]
+        val tpI = eds[eds.size - 2]
+        val slI = eds[eds.size - 1]
+        val vol = parseNum(volI.t) ?: 0.01
         if (vol <= 0.0) return null
 
-        val id = idL?.let { l -> rowOf(all, l).firstOrNull { cleanNum(it.t) != null }?.t }
-            ?.let { cleanNum(it) }
-
-        fun field(label: Item): Item? {
-            val row = rowOf(all, label)
-            return row.firstOrNull { it.n.isEditable } ?: row.firstOrNull { cleanNum(it.t) != null }
+        // عدد دلاری کنار هر فیلد: یا گره جدا هم‌ردیف، یا داخل متن ادغام‌شده
+        val iTp = d.indexOf("حد سود")
+        val iSl = d.indexOf("حد ضرر")
+        var tpSeg = ""
+        var slSeg = ""
+        if (iTp >= 0 && iSl >= 0) {
+            if (iTp < iSl) {
+                tpSeg = d.substring(iTp, iSl)
+                slSeg = d.substring(iSl).substringBefore("بستن")
+            } else {
+                slSeg = d.substring(iSl, iTp)
+                tpSeg = d.substring(iTp).substringBefore("بستن")
+            }
         }
-
-        fun usd(label: Item): Double? {
-            parseDollar(label.t)?.let { return it }
-            return rowOf(all, label).firstNotNullOfOrNull { parseDollar(it.t) }
+        fun nearUsd(row: Item): Double? {
+            val tol = max(30, (row.r.height() * 0.6).toInt())
+            return all.firstNotNullOfOrNull { cand ->
+                if (cand === dlg || cand.n.isEditable) null
+                else if (abs(cand.r.centerY() - row.r.centerY()) <= tol) parseDollar(cand.t)
+                else null
+            }
         }
+        val tpUsd = nearUsd(tpI) ?: parseDollar(tpSeg)
+        val slUsd = nearUsd(slI) ?: parseDollar(slSeg)
 
-        val tpF = field(tpL)
-        val slF = field(slL)
+        val wpx = resources.displayMetrics.widthPixels.toFloat()
+        val sc = wpx / 1080f
         return Ctx(
             buy = hasBuy,
             sym = sym,
@@ -380,13 +420,14 @@ class TpSlService : AccessibilityService() {
             decimals = decimals,
             vol = vol,
             id = id,
-            tpField = tpF?.n,
-            tpVal = tpF?.let { parseNum(it.t) ?: 0.0 },
-            tpUsd = usd(tpL),
-            slField = slF?.n,
-            slVal = slF?.let { parseNum(it.t) ?: 0.0 },
-            slUsd = usd(slL),
-            confirm = confirm?.n
+            tpField = tpI.n,
+            tpVal = parseNum(tpI.t) ?: 0.0,
+            tpUsd = tpUsd,
+            slField = slI.n,
+            slVal = parseNum(slI.t) ?: 0.0,
+            slUsd = slUsd,
+            confirmX = wpx / 2f,
+            confirmY = slI.r.centerY() + 166f * sc
         )
     }
 
@@ -523,6 +564,7 @@ class TpSlService : AccessibilityService() {
         bubble.background = bg(0xCC1E88E5.toInt(), dp(24))
         bubble.layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
 
+        bubbleView = bubble
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
         content.visibility = View.GONE
@@ -538,6 +580,21 @@ class TpSlService : AccessibilityService() {
         auto.isChecked = prefs.getBoolean("auto", true)
         auto.setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("auto", b).apply() }
         content.addView(auto, lpWrap())
+
+        val conf = CheckBox(this)
+        conf.text = "تایید خودکار"
+        conf.setTextColor(Color.WHITE)
+        conf.isChecked = prefs.getBoolean("confirm", false)
+        conf.setOnCheckedChangeListener { _, b -> prefs.edit().putBoolean("confirm", b).apply() }
+        content.addView(conf, lpWrap())
+
+        val st = TextView(this)
+        st.setTextColor(0xFFBBBBBB.toInt())
+        st.textSize = 12f
+        st.maxWidth = dp(230)
+        st.text = "آماده"
+        statusView = st
+        content.addView(st, lpWrap())
 
         val btnRow = LinearLayout(this)
         btnRow.orientation = LinearLayout.HORIZONTAL
@@ -640,6 +697,16 @@ class TpSlService : AccessibilityService() {
     }
 
     private fun toast(msg: String) {
-        ui.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+        ui.post {
+            try {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {
+            }
+            statusView?.text = msg
+            bubbleView?.let { b ->
+                b.text = if (msg.contains("✓")) "✓" else "!"
+                ui.postDelayed({ b.text = "⚡" }, 4000)
+            }
+        }
     }
 }
