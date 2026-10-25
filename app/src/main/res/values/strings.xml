@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">TP SL Helper</string>
+    <string name="service_desc">پر کردن خودکار حد سود و حد ضرر در پنجره معامله</string>
+</resources>
